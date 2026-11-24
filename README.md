@@ -1,36 +1,101 @@
 # XPFlow
 
-XPFlow is an independently implemented NVIDIA GPU scheduler for research workstations. Its scheduling design draws inspiration from [gflow](https://github.com/AndPuQing/gflow). XPFlow includes no gflow source code.
+XPFlow is an open-source NVIDIA GPU scheduler for research teams that train and evaluate models on a shared Linux workstation. It runs your existing commands, waits for a GPU with enough headroom, and automatically queues evaluations as training writes checkpoints.
 
-**Current support:** single-node scheduling. **Planned:** multi-node scheduling.
+Use it when training, batch inference, and evaluation compete for the same cards, and you want comparable results without keeping every raw rollout or per-frame dump.
+
+- **Schedule around live GPU load.** Configure how long utilization and memory use must stay below admission thresholds. A separate runtime guard stops the job when either reading reaches its red line. Reserve cards for evaluation or batch inference and decide whether those jobs can borrow training cards.
+- **Evaluate checkpoints as they appear.** Watch a directory, deduplicate checkpoints by content, and run your evaluator. An optional CPU phase can check or summarize results after the GPU is released. Metric gates can block downstream jobs.
+- **Keep the raw results that matter.** Rank evaluations within a series. With retention enabled, keep the raw outputs of the strict-success and mean-error winners and leave reports and rebuild manifests for the other attempts.
+
+**Supported today:** single-node scheduling, one GPU per GPU phase. **Planned:** multi-node scheduling.
 
 ## Quick start
 
 Use Linux with procfs and POSIX file locks, Python 3.10+, NVIDIA drivers and `nvidia-smi`. The queue uses a local filesystem with atomic rename. Run the scheduler and clients under the same Unix account.
 
 ```bash
+git clone https://github.com/daoshi1593/xpflow-public.git
+cd xpflow-public
+```
+
+```bash
 export XPFLOW_HOME="$HOME/.local/share/xpflow"
 python3 xpflow.py serve
-# Use the same XPFLOW_HOME in another terminal.
-python3 xpflow.py submit --name demo --kind train --cwd "$PWD" -- python3 train.py
+```
+
+In a second terminal at the repository root, submit a smoke-test command and inspect the queue.
+
+```bash
+export XPFLOW_HOME="$HOME/.local/share/xpflow"
+python3 xpflow.py submit --name demo --kind train --cwd "$PWD" -- \
+  python3 -c 'import os; print("Assigned GPU:", os.environ["CUDA_VISIBLE_DEVICES"])'
 python3 xpflow.py status
 python3 xpflow.py idle
-python3 xpflow.py cancel /absolute/path/to/attempt
-python3 xpflow.py retry /absolute/path/to/ended-attempt
-python3 xpflow.py leaderboard
 ```
 
 One foreground scheduler holds the queue lock. Detached workers survive scheduler restarts. Every attempt has its own request, combined log and state files. Status emits JSON lines with state, GPU, exit, failure and retry lineage. `idle` shows instantaneous eligibility. Admission also requires sustained low readings and a worker-side recheck.
 
-### Scheduling and recovery
+## Try automatic checkpoint evaluation
+
+Run this from the repository root on a Linux host with an eligible NVIDIA GPU. It uses an isolated queue and a toy checkpoint so you can try the workflow without a training framework or dataset. The toy evaluator reports fixed metrics and does no CUDA computation.
+
+```bash
+export XPFLOW_HOME="$(mktemp -d)"
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["XPFLOW_HOME"])
+(root / "checkpoints").mkdir()
+(root / "evaluate.py").write_text(
+    "from pathlib import Path\nimport sys\n"
+    "print('Evaluated', Path(sys.argv[1]).read_text())\n"
+)
+(root / "audit.py").write_text(
+    "import json, os\nfrom pathlib import Path\n"
+    "assert os.environ['CUDA_VISIBLE_DEVICES'] == ''\n"
+    "attempt = Path(os.environ['XPFLOW_ATTEMPT'])\n"
+    "(attempt / 'report.json').write_text(json.dumps("
+    "{'strict_success': 105, 'mean_error': 0.012, 'unsafe': 0}))\n"
+)
+(root / "config.json").write_text(json.dumps({
+    "checkpoint_watches": [{
+        "name": "demo-eval",
+        "cwd": str(root),
+        "glob": "checkpoints/*.ckpt",
+        "argv": ["python3", "evaluate.py", "{checkpoint}"],
+        "after_gpu": ["python3", "audit.py"],
+        "series": "demo-v1",
+        "quality_gate": {"strict_success": {"min": 100}, "unsafe": {"max": 0}},
+    }],
+}))
+PY
+printf 'demo model\n' > "$XPFLOW_HOME/checkpoints/step-1.tmp"
+mv "$XPFLOW_HOME/checkpoints/step-1.tmp" "$XPFLOW_HOME/checkpoints/step-1.ckpt"
+printf 'In a second terminal use XPFLOW_HOME=%s\n' "$XPFLOW_HOME"
+python3 xpflow.py serve
+```
+
+In a second terminal at the repository root, set and export the printed `XPFLOW_HOME`, then run the following commands. Give the watcher at least 10 seconds after publication and allow time for GPU admission. Once the attempt completes, the leaderboard shows `demo-v1` with 105 strict successes and a mean error of 0.012.
+
+```bash
+python3 xpflow.py status
+python3 xpflow.py leaderboard
+```
+
+For a real project, point the watch at your checkpoint directory, replace both commands with your scripts, and write the evaluation metrics to `report.json`. To enable cleanup, write disposable outputs under the attempt's `artifacts/` directory and set `retain_series_best` on the watch.
+
+## Scheduling and recovery
 
 - Training precedes evaluation. New training submissions precede training retries, with FIFO within each class. Evaluations with `--checkpoint /absolute/file` prioritize newer checkpoint modification times. Evaluations without checkpoint metadata run FIFO.
 - XPFlow stops a GPU phase at either runtime threshold or if GPU sampling fails. The measurements cover the whole card. Other activity and the job's own computation can trip the guard.
-- Failed attempts retry up to the configured limit. Override it with `--max-retries N`, including zero. Repeated retry requests for one predecessor reuse its successor. A manual retry starts a fresh allowance when it creates a successor. The command handles any model checkpoint resumption.
-- `cancel` requests termination of the job's process group and suppresses automatic retry for the attempt. Recovery verifies Linux boot ID and process start time before terminating a recorded orphan. An unidentified process holding the worker lock can keep a card reserved until it exits.
+- Failed attempts retry up to the configured limit. Override it with `--max-retries N`, including zero. Run `python3 xpflow.py retry /absolute/path/to/ended-attempt` to retry manually. Repeated retry requests for one predecessor reuse its successor. A manual retry starts a fresh allowance when it creates a successor. The command handles any model checkpoint resumption.
+- Run `python3 xpflow.py cancel /absolute/path/to/attempt` to request termination of the job's process group and suppress automatic retry for the attempt. Recovery verifies Linux boot ID and process start time before terminating a recorded orphan. An unidentified process holding the worker lock can keep a card reserved until it exits.
 - Repeat `--depends-on /absolute/attempt` to require successful prerequisites. Dependencies refer to exact attempts. A failed, cancelled or blocked prerequisite blocks its dependents.
 
-### Evaluation workflows
+## Evaluation options
 
 ```bash
 python3 xpflow.py submit --name regression --kind eval --cwd "$PWD" \
@@ -123,4 +188,10 @@ XPFlow runs trusted local commands using the scheduler account. It assigns one G
 
 Run `python3 -m unittest discover -s tests -v` for CPU-only tests. Validate real GPU behavior on the deployment host.
 
-MIT. See [origin](docs/ORIGIN.md).
+## Contributing
+
+For bug reports, include your Linux and Python versions, the relevant XPFlow configuration, and a minimal command or checkpoint watch that reproduces the issue. Remove private paths or credentials from logs before sharing them. For code changes, include the relevant test results and describe any real-GPU checks you ran.
+
+## License and origin
+
+[MIT](LICENSE). XPFlow is independently implemented. Its scheduling design draws inspiration from [gflow](https://github.com/AndPuQing/gflow). See [project origin](docs/ORIGIN.md).
